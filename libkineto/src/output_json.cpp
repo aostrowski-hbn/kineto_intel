@@ -17,6 +17,7 @@
 #include <string_view>
 #include "Config.h"
 #include "EnvMetadata.h"
+#include "ThreadUtil.h"
 #include "TraceSpan.h"
 
 #include "Logger.h"
@@ -240,7 +241,8 @@ void ChromeTraceLogger::writeCompleteEvent(
     std::string_view tid,
     int64_t ts,
     int64_t dur,
-    const ArgsBuilder& args) {
+    const ArgsBuilder& args,
+    std::string_view extraFields) {
   // clang-format off
   fmt::print(traceOf_, R"JSON(
   {{
@@ -250,10 +252,17 @@ void ChromeTraceLogger::writeCompleteEvent(
     "pid": {},
     "tid": {},
     "ts": {},
-    "dur": {}
+    "dur": {}{}
     {}
   }},)JSON",
-      cat, name, pid, tid, fmtTs(ts), fmtTs(dur), args.renderField());
+      cat,
+      name,
+      pid,
+      tid,
+      fmtTs(ts),
+      fmtTs(dur),
+      extraFields,
+      args.renderField());
   // clang-format on
 }
 
@@ -362,9 +371,17 @@ void ChromeTraceLogger::writeCompleteEvent(
     int64_t tid,
     int64_t ts,
     int64_t dur,
-    const ArgsBuilder& args) {
+    const ArgsBuilder& args,
+    std::string_view extraFields) {
   writeCompleteEvent(
-      cat, name, std::to_string(pid), std::to_string(tid), ts, dur, args);
+      cat,
+      name,
+      std::to_string(pid),
+      std::to_string(tid),
+      ts,
+      dur,
+      args,
+      extraFields);
 }
 
 void ChromeTraceLogger::writeInstantEvent(
@@ -547,7 +564,13 @@ void ChromeTraceLogger::handleResourceInfo(
     return;
   }
 
+  // GenericActivityProfiler stores the native pthread name in ResourceInfo.
+  // Preserve Chrome JSON's legacy display format for host CPU threads while
+  // leaving GPU streams and other synthetic resources unchanged.
   std::string name = info.name;
+  if (info.resourceType == ResourceType::HOST_THREAD) {
+    name = fmt::format("thread {} ({})", info.id, info.name);
+  }
   sanitizeStrForJSON(name);
   escapeQuotesForJSON(name);
 
@@ -941,6 +964,16 @@ void ChromeTraceLogger::handleActivity(const libkineto::ITraceActivity& op) {
   sanitizeForNonReadableChars(op_name);
   escapeQuotesForJSON(op_name);
 
+  const bool inlineInstructionFlow = op.flowId() > 0 &&
+      op.type() == ActivityType::MTIA_INSIGHT &&
+      op.getMetadataValue("event_type") == "instruction_trace";
+  const std::string flowFields = inlineInstructionFlow
+      ? fmt::format(
+            ",\n    \"bind_id\": {},\n    \"{}\": true",
+            op.flowId(),
+            op.flowStart() ? "flow_out" : "flow_in")
+      : std::string{};
+
   ts = transToRelativeTime(ts);
   writeCompleteEvent(
       /*cat=*/toString(op.type()),
@@ -949,8 +982,9 @@ void ChromeTraceLogger::handleActivity(const libkineto::ITraceActivity& op) {
       /*tid=*/sanitizeTid(resource),
       /*ts=*/ts,
       /*dur=*/duration,
-      /*args=*/args);
-  if (op.flowId() > 0) {
+      /*args=*/args,
+      /*extraFields=*/flowFields);
+  if (op.flowId() > 0 && !inlineInstructionFlow) {
     handleGenericLink(op);
   }
 }

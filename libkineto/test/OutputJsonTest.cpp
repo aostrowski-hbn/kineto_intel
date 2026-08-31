@@ -12,10 +12,13 @@
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "include/GenericTraceActivity.h"
+#include "include/ThreadUtil.h"
 #include "include/TraceSpan.h"
 #include "src/output_json.h"
 #include "test/TestUtils.h"
@@ -150,6 +153,81 @@ TEST(OutputJsonTest, PlainEventNameIsUnchanged) {
   expectEventNameRoundTrips("aten::addmm");
 }
 
+TEST(OutputJsonTest, InstructionFlowIsAttachedToDurationSlices) {
+  const auto traceFile =
+      libkineto::test::createTempTraceFile("OutputJsonTest.", ".json");
+  TraceSpan span(0, 0, "test_span");
+
+  GenericTraceActivity receive(span, ActivityType::MTIA_INSIGHT, "sdin r1, r2");
+  receive.startTime = 100;
+  receive.endTime = 200;
+  receive.device = 10;
+  receive.resource = 20;
+  receive.flow.id = 123;
+  receive.flow.type = kLinkAsyncCpuGpu;
+  receive.flow.start = true;
+  receive.addMetadataQuoted("event_type", "instruction_trace");
+
+  GenericTraceActivity dispatch = receive;
+  dispatch.startTime = 300;
+  dispatch.endTime = 400;
+  dispatch.resource = 21;
+  dispatch.flow.start = false;
+
+  TestableChromeTraceLogger logger(traceFile.path());
+  logger.handleTraceStart({}, "");
+  logger.handleGenericActivity(receive);
+  logger.handleGenericActivity(dispatch);
+  logger.finalizeTrace(/*endTime=*/500);
+
+  const auto trace = nlohmann::json::parse(readFile(traceFile.path()));
+  std::vector<nlohmann::json> slices;
+  size_t standaloneFlows = 0;
+  for (const auto& event : trace["traceEvents"]) {
+    if (event.value("ph", "") == "s" || event.value("ph", "") == "f") {
+      ++standaloneFlows;
+    }
+    if (event.value("name", "") == "sdin r1, r2") {
+      slices.push_back(event);
+    }
+  }
+  ASSERT_EQ(slices.size(), 2);
+  EXPECT_EQ(slices[0]["bind_id"], 123);
+  EXPECT_TRUE(slices[0]["flow_out"]);
+  EXPECT_FALSE(slices[0].contains("flow_in"));
+  EXPECT_EQ(slices[1]["bind_id"], 123);
+  EXPECT_TRUE(slices[1]["flow_in"]);
+  EXPECT_FALSE(slices[1].contains("flow_out"));
+  EXPECT_EQ(standaloneFlows, 0);
+}
+
+TEST(OutputJsonTest, DisplayContainsThreadNameAndTID) {
+  const auto traceFile =
+      libkineto::test::createTempTraceFile("OutputJsonTest.", ".json");
+  TestableChromeTraceLogger logger(traceFile.path());
+  logger.handleTraceStart({}, "");
+  logger.handleResourceInfo(
+      ResourceInfo{
+          /*id=*/12345,
+          /*sortIndex=*/0,
+          /*deviceId=*/processId(),
+          /*name=*/"worker",
+          /*resourceType=*/ResourceType::HOST_THREAD},
+      /*time=*/100);
+  logger.finalizeTrace(/*endTime=*/300);
+
+  const auto trace = nlohmann::json::parse(readFile(traceFile.path()));
+  bool found = false;
+  for (const auto& event : trace["traceEvents"]) {
+    if (event.value("name", "") == "thread_name" &&
+        event["args"].value("name", "") == "thread 12345 (worker)") {
+      found = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
 // Collective strings arrive quoted from the legacy RawJson path and unquoted
 // from the typed path. Kineto must strip and re-quote them so the GPU-kernel
 // args and distributedInfo have identical string shapes.
@@ -224,4 +302,46 @@ TEST(OutputJsonTest, ResourceInfoWithQuotesProducesValidJson) {
     }
   }
   EXPECT_TRUE(found);
+}
+
+TEST(OutputJsonTest, HardwareCountersUseDedicatedGpuCounterTrack) {
+  const auto traceFile =
+      libkineto::test::createTempTraceFile("OutputJsonTest.", ".json");
+
+  const int64_t timestamp = ChromeTraceBaseTime::singleton().get() + 123456;
+  TraceSpan span(timestamp, 0, "test_span");
+  GenericTraceActivity activity(
+      span, ActivityType::HARDWARE_COUNTERS, "CUPTI PM Sampling");
+  activity.startTime = timestamp;
+  activity.endTime = timestamp + 1000;
+  activity.device = 2;
+  activity.resource = 7;
+  activity.addCounterValue("sm__cycles_active.avg", 1.25);
+  activity.addCounterValue("dram__bytes_read.sum", 2048.0);
+
+  TestableChromeTraceLogger logger(traceFile.path());
+  logger.handleTraceStart({}, "");
+  logger.handleActivity(activity);
+  logger.finalizeTrace(timestamp + 2000);
+
+  const auto trace = nlohmann::json::parse(readFile(traceFile.path()));
+  std::map<std::string, double> counters;
+  for (const auto& event : trace["traceEvents"]) {
+    if (event.value("ph", "") != "C" ||
+        event.value("cat", "") != "hardware_counters") {
+      continue;
+    }
+
+    EXPECT_EQ(event["pid"], "GPU 2 Counters");
+    EXPECT_EQ(event["tid"], 7);
+    EXPECT_DOUBLE_EQ(event["ts"].get<double>(), 123.456);
+    ASSERT_TRUE(event.contains("args"));
+    ASSERT_TRUE(event["args"].contains(""));
+    counters.emplace(
+        event["name"].get<std::string>(), event["args"][""].get<double>());
+  }
+
+  ASSERT_EQ(counters.size(), 2);
+  EXPECT_DOUBLE_EQ(counters.at("sm__cycles_active.avg"), 1.25);
+  EXPECT_DOUBLE_EQ(counters.at("dram__bytes_read.sum"), 2048.0);
 }

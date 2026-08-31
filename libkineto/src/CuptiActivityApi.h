@@ -46,6 +46,7 @@ class CuptiActivityApi {
   static void pushCorrelationID(int id, CorrelationFlowType type);
   static void popCorrelationID(CorrelationFlowType type);
 
+  virtual bool isAvailable(uint32_t& version) const;
   void enableCuptiActivities(
       const std::set<ActivityType>& selected_activities,
       bool enablePerThreadBuffers = false);
@@ -98,6 +99,7 @@ class CuptiActivityApi {
       size_t validSize);
 
  protected:
+  bool canRejectBuffer_{false};
   void bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords);
   void bufferCompleted(
       CUcontext ctx,

@@ -25,6 +25,7 @@ namespace KINETO_NAMESPACE {
 // Given the kDefaultActivitiesMaxGpuBufferSize is around 128MB, in the worst
 // case, there will be 32 buffers contending for the mutex.
 constexpr size_t kBufSize(4 * 1024 * 1024);
+constexpr uint32_t kCuptiBufferRejectionMinVersion = 27;
 
 inline bool cuptiTearDown_() {
   auto teardown_env = getenv("TEARDOWN_CUPTI");
@@ -58,6 +59,11 @@ inline void reenableCuptiCallbacks_(CuptiCallbackApi& cbapi) {
 CuptiActivityApi& CuptiActivityApi::singleton() {
   static auto* instance = new CuptiActivityApi();
   return *instance;
+}
+
+bool CuptiActivityApi::isAvailable(uint32_t& version) const {
+  return isGpuAvailable() &&
+      CUPTI_CALL_NOWARN(cuptiGetVersion(&version)) == CUPTI_SUCCESS;
 }
 
 void CuptiActivityApi::pushCorrelationID(int id, CorrelationFlowType type) {
@@ -147,16 +153,18 @@ void CuptiActivityApi::bufferRequested(
     size_t* maxNumRecords) {
   std::lock_guard<std::mutex> guard(mutex_);
   LOG(VERBOSE) << "CUPTI buffer requested";
-  if (static_cast<int64_t>(allocatedGpuTraceBuffers_.size()) >=
-      maxGpuBufferCount_) {
+
+  if (!stopCollection &&
+      static_cast<int64_t>(allocatedGpuTraceBuffers_.size()) >=
+          maxGpuBufferCount_) {
     stopCollection = true;
     LOG(WARNING) << "Exceeded max GPU buffer count ("
                  << allocatedGpuTraceBuffers_.size()
                  << " >= " << maxGpuBufferCount_ << ") - terminating tracing";
-    // Return null buffer to CUPTI. Per the CUPTI documentation for
-    // CUpti_BuffersCallbackRequestFunc: "If set to NULL then no buffer is
-    // returned." CUPTI will drop activity records, which are counted by
-    // cuptiActivityGetNumDroppedRecords.
+  }
+  // Rejecting buffers can crash CUPTI before API v27 (CUDA 12.9), so older or
+  // unknown versions must receive valid buffers until tracing terminates.
+  if (stopCollection && canRejectBuffer_) {
     *buffer = nullptr;
     *size = 0;
     *maxNumRecords = 0;
@@ -245,6 +253,10 @@ void CuptiActivityApi::clearActivities() {
   {
     std::lock_guard<std::mutex> guard(mutex_);
     if (allocatedGpuTraceBuffers_.empty()) {
+      // Nothing is in flight, so there is nothing to flush - but CUPTI may have
+      // already handed back completed buffers, and callers ask us to clear so
+      // that those records do not reach the trace.
+      readyGpuTraceBuffers_.reset();
       return;
     }
   }
@@ -257,7 +269,7 @@ void CuptiActivityApi::clearActivities() {
   // for active tracing during warmup.
   std::lock_guard<std::mutex> guard(mutex_);
   // Throw away ready buffers as a result of above flush
-  readyGpuTraceBuffers_ = nullptr;
+  readyGpuTraceBuffers_.reset();
 }
 
 void CUPTIAPI CuptiActivityApi::bufferCompletedTrampoline(
@@ -281,6 +293,12 @@ void CuptiActivityApi::bufferCompleted(
     if (it == allocatedGpuTraceBuffers_.end()) {
       LOG(ERROR) << "bufferCompleted called with unknown buffer: "
                  << static_cast<void*>(buffer);
+      return;
+    }
+
+    if (stopCollection && !canRejectBuffer_) {
+      // Prevent buffers from accumulating when CUPTI cannot reject them.
+      allocatedGpuTraceBuffers_.erase(it);
       return;
     }
 
@@ -317,6 +335,15 @@ void CuptiActivityApi::enableCuptiActivities(
   auto& cbapi = CuptiCallbackApi::singleton();
   if ((tracingEnabled_ == 0u) && !cbapi.initSuccess() && cuptiLazyInit_()) {
     reenableCuptiCallbacks_(cbapi);
+  }
+
+  uint32_t cuptiVersion = 0;
+  CUPTI_CALL(cuptiGetVersion(&cuptiVersion));
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    canRejectBuffer_ = cuptiVersion >= kCuptiBufferRejectionMinVersion;
+    // Reset before callbacks can run for the new trace.
+    stopCollection = false;
   }
 
   if (enablePerThreadBuffers) {
@@ -382,9 +409,6 @@ void CuptiActivityApi::enableCuptiActivities(
   }
 
   tracingEnabled_ = 1;
-
-  // Explicitly enabled, so reset this flag if set
-  stopCollection = false;
 }
 
 void CuptiActivityApi::disableCuptiActivities(

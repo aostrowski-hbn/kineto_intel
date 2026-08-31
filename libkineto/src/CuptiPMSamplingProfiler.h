@@ -28,6 +28,8 @@ class CuptiPMSamplingSession final
     : public libkineto::IActivityProfilerSession {
  public:
   explicit CuptiPMSamplingSession(const CuptiPMSamplingConfig& config);
+  explicit CuptiPMSamplingSession(
+      std::unique_ptr<ICuptiPMSamplingController> controller);
   ~CuptiPMSamplingSession() override;
 
   [[nodiscard]] bool prepare();
@@ -35,6 +37,11 @@ class CuptiPMSamplingSession final
   void stop() override;
   [[nodiscard]] std::vector<std::string> errors() override;
   void processTrace(libkineto::ActivityLogger& logger) override;
+  void processTrace(
+      libkineto::ActivityLogger& logger,
+      libkineto::getLinkedActivityCallback getLinkedActivity,
+      int64_t startTime,
+      int64_t endTime) override;
   [[nodiscard]] std::unique_ptr<libkineto::DeviceInfo> getDeviceInfo() override;
   [[nodiscard]] std::vector<libkineto::ResourceInfo> getResourceInfos()
       override;
@@ -44,7 +51,7 @@ class CuptiPMSamplingSession final
  private:
   [[nodiscard]] std::unique_ptr<libkineto::CpuTraceBuffer> buildTraceBuffer();
 
-  CuptiPMSamplingController controller_;
+  std::unique_ptr<ICuptiPMSamplingController> controller_;
   std::unique_ptr<libkineto::CpuTraceBuffer> traceBuffer_;
 };
 

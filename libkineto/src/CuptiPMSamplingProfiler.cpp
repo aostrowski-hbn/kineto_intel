@@ -34,7 +34,12 @@ constexpr std::chrono::milliseconds kSamplingInterval{1};
 
 CuptiPMSamplingSession::CuptiPMSamplingSession(
     const CuptiPMSamplingConfig& config)
-    : controller_(config) {}
+    : CuptiPMSamplingSession(
+          std::make_unique<CuptiPMSamplingController>(config)) {}
+
+CuptiPMSamplingSession::CuptiPMSamplingSession(
+    std::unique_ptr<ICuptiPMSamplingController> controller)
+    : controller_(std::move(controller)) {}
 
 CuptiPMSamplingSession::~CuptiPMSamplingSession() = default;
 
@@ -50,20 +55,20 @@ bool CuptiPMSamplingSession::prepare() {
 
   // prepare() enables CUPTI PM sampling and acquires exclusive access during
   // the parent profiler's warmup phase. Collection itself begins in start().
-  if (!controller_.prepare()) {
+  if (!controller_->prepare()) {
     LOG(WARNING) << "CUPTI PM sampling failed to prepare CUDA device "
-                 << controller_.deviceId();
+                 << controller_->deviceId();
     return false;
   }
   return true;
 }
 
 void CuptiPMSamplingSession::start() {
-  controller_.start();
+  controller_->start();
 }
 
 void CuptiPMSamplingSession::stop() {
-  if (controller_.stop()) {
+  if (controller_->stop()) {
     traceBuffer_ = buildTraceBuffer();
   }
 }
@@ -74,8 +79,6 @@ std::vector<std::string> CuptiPMSamplingSession::errors() {
   return {};
 }
 
-// TODO: Override the capture-window processTrace overload and exclude samples
-// collected during shutdown that fall outside the requested trace interval.
 void CuptiPMSamplingSession::processTrace(libkineto::ActivityLogger& logger) {
   if (!traceBuffer_) {
     return;
@@ -83,6 +86,44 @@ void CuptiPMSamplingSession::processTrace(libkineto::ActivityLogger& logger) {
   for (const auto& activity : traceBuffer_->activities) {
     logger.handleActivity(libkineto::CpuTraceBuffer::toRef(activity));
   }
+}
+
+void CuptiPMSamplingSession::processTrace(
+    libkineto::ActivityLogger& logger,
+    libkineto::getLinkedActivityCallback /*getLinkedActivity*/,
+    int64_t startTime,
+    int64_t endTime) {
+  if (!traceBuffer_) {
+    return;
+  }
+
+  // Drop PM samples that are not fully contained in [startTime, endTime].
+  auto& activities = traceBuffer_->activities;
+  activities.erase(
+      std::remove_if(
+          activities.begin(),
+          activities.end(),
+          [startTime, endTime](const auto& activity) {
+            return activity->startTime < startTime ||
+                activity->endTime > endTime;
+          }),
+      activities.end());
+
+  if (activities.empty()) {
+    traceBuffer_->span.startTime = startTime;
+    traceBuffer_->span.endTime = endTime;
+  } else {
+    traceBuffer_->span.startTime = activities.front()->startTime;
+    traceBuffer_->span.endTime = activities.front()->endTime;
+    for (size_t i = 1; i < activities.size(); ++i) {
+      traceBuffer_->span.startTime =
+          std::min(traceBuffer_->span.startTime, activities[i]->startTime);
+      traceBuffer_->span.endTime =
+          std::max(traceBuffer_->span.endTime, activities[i]->endTime);
+    }
+  }
+
+  processTrace(logger);
 }
 
 std::unique_ptr<libkineto::DeviceInfo> CuptiPMSamplingSession::getDeviceInfo() {
@@ -104,8 +145,8 @@ std::unique_ptr<libkineto::CpuTraceBuffer> CuptiPMSamplingSession::
   auto buffer = std::make_unique<libkineto::CpuTraceBuffer>();
   buffer->span = libkineto::TraceSpan{0, 0, kProfilerName};
 
-  const auto samples = controller_.takeSamples();
-  const auto& metricNames = controller_.metricNames();
+  const auto samples = controller_->takeSamples();
+  const auto& metricNames = controller_->metricNames();
   for (const auto& sample : samples) {
     const auto start = convertCuptiTimestamp(sample.rawStartTimestamp);
     const auto end = convertCuptiTimestamp(sample.rawEndTimestamp);
@@ -125,7 +166,7 @@ std::unique_ptr<libkineto::CpuTraceBuffer> CuptiPMSamplingSession::
     auto& activity = *buffer->activities.back();
     activity.startTime = start;
     activity.endTime = end;
-    activity.device = controller_.deviceId();
+    activity.device = controller_->deviceId();
     for (size_t i = 0; i < metricNames.size(); ++i) {
       activity.addCounterValue(metricNames[i], sample.values[i]);
     }
@@ -145,23 +186,17 @@ const std::set<libkineto::ActivityType>& CuptiPMSamplingProfiler::
 
 std::unique_ptr<libkineto::IActivityProfilerSession> CuptiPMSamplingProfiler::
     configure(
-        const std::set<libkineto::ActivityType>& activityTypes,
+        const std::set<libkineto::ActivityType>& /*activityTypes*/,
         const libkineto::Config& config) {
-  if (activityTypes.find(libkineto::ActivityType::HARDWARE_COUNTERS) ==
-      activityTypes.end()) {
-    return nullptr;
-  }
-
-  // Translate from the Kineto config into the sampling-specific config
-  const auto& metricNames = config.cuptiPMSamplingMetricNames();
+  const auto& metricNames = config.performanceMetricNames();
   if (metricNames.empty()) {
     return nullptr;
   }
 
-  const auto deviceId = config.cuptiPMSamplingDeviceId();
+  const auto deviceId = config.performanceMetricsDeviceId();
   if (deviceId < 0) {
     LOG(WARNING) << "CUPTI PM sampling requires a nonnegative "
-                    "CUPTI_PM_SAMPLING_DEVICE_ID";
+                    "PERFORMANCE_METRICS_DEVICE_ID";
     return nullptr;
   }
 

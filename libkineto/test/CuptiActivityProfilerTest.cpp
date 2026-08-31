@@ -11,12 +11,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
-#include <stdlib.h> // NOLINT(modernize-deprecated-headers) required for setenv unsetenv
+#include <stdlib.h> // NOLINT(modernize-deprecated-headers) required for malloc free
 
-#include <strings.h>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <variant>
@@ -261,7 +261,7 @@ struct MockCuptiActivityBuffer {
   template <class T>
   T& createActivity(int64_t start_ns, int64_t end_ns, int64_t correlation) {
     T& act = *static_cast<T*>(malloc(sizeof(T)));
-    bzero(&act, sizeof(act));
+    std::memset(&act, 0, sizeof(act));
     act.start = start_ns;
     act.end = end_ns;
     act.correlationId = correlation;
@@ -271,7 +271,7 @@ struct MockCuptiActivityBuffer {
   template <class T>
   T& createActivity(int64_t correlation) {
     T& act = *static_cast<T*>(malloc(sizeof(T)));
-    bzero(&act, sizeof(act));
+    std::memset(&act, 0, sizeof(act));
     act.correlationId = correlation;
     return act;
   }
@@ -285,9 +285,45 @@ struct MockCuptiActivityBuffer {
   std::vector<CUpti_Activity*> activities;
 };
 
+// Drives the real buffer callbacks so tests can check the bookkeeping without a
+// CUDA context. Two preconditions keep that from reaching into live CUPTI, and
+// both are easy to break.
+//
+// First, the completed buffer carries a null context. At verbosity 1 and above
+// bufferCompleted asks CUPTI for its dropped-record count, so a run at that
+// verbosity makes a real CUPTI call with that null context. Only the paths that
+// discard a buffer outright return before reaching it.
+//
+// Second, every test drains the allocated buffers before calling
+// activityBuffers or clearActivities, both of which short-circuit when nothing
+// is in flight. A test that leaves a buffer allocated will instead ask CUPTI to
+// flush for real.
+class CallbackCuptiActivityApi : public CuptiActivityApi {
+ public:
+  using CuptiActivityApi::canRejectBuffer_;
+
+  std::pair<uint8_t*, size_t> requestBuffer(
+      uint8_t* buffer = nullptr,
+      size_t size = 0) {
+    size_t maxNumRecords = 1;
+    bufferRequested(&buffer, &size, &maxNumRecords);
+    EXPECT_EQ(maxNumRecords, 0);
+    return {buffer, size};
+  }
+
+  void completeBuffer(uint8_t* buffer, size_t size) {
+    bufferCompleted(nullptr, 0, buffer, 0, size);
+  }
+};
+
 // Mock parts of the CuptiActivityApi
 class MockCuptiActivities : public CuptiActivityApi {
  public:
+  bool isAvailable(uint32_t& version) const override {
+    version = 0;
+    return available;
+  }
+
   const std::pair<int, size_t> processActivities(
       [[maybe_unused]] CuptiActivityBufferMap& bufferMap,
       const std::function<void(const CUpti_Activity*)>& handler) override {
@@ -305,15 +341,73 @@ class MockCuptiActivities : public CuptiActivityApi {
     return map;
   }
 
-  void bufferRequestedOverride(
-      uint8_t** buffer,
-      size_t* size,
-      size_t* maxNumRecords) {
-    this->bufferRequested(buffer, size, maxNumRecords);
-  }
-
   std::unique_ptr<MockCuptiActivityBuffer> activityBuffer;
+  bool available{true};
 };
+
+TEST(CuptiActivityApiTest, KeepsReturningValidBuffersWhenRejectionUnsupported) {
+  CallbackCuptiActivityApi cupti;
+  cupti.canRejectBuffer_ = false;
+  cupti.setMaxBufferSize(0);
+
+  auto [firstBuffer, firstSize] = cupti.requestBuffer();
+  ASSERT_NE(firstBuffer, nullptr);
+  ASSERT_GT(firstSize, 0);
+  EXPECT_FALSE(cupti.stopCollection);
+  auto [secondBuffer, secondSize] = cupti.requestBuffer(firstBuffer, firstSize);
+  EXPECT_TRUE(cupti.stopCollection);
+
+  ASSERT_NE(secondBuffer, nullptr);
+  ASSERT_GT(secondSize, 0);
+
+  auto [thirdBuffer, thirdSize] = cupti.requestBuffer();
+  ASSERT_NE(thirdBuffer, nullptr);
+  EXPECT_NE(thirdBuffer, secondBuffer);
+
+  cupti.completeBuffer(firstBuffer, firstSize);
+  cupti.completeBuffer(secondBuffer, secondSize);
+  cupti.completeBuffer(thirdBuffer, thirdSize);
+  EXPECT_EQ(cupti.activityBuffers(), nullptr);
+}
+
+TEST(CuptiActivityApiTest, RejectsBuffersWhenSupported) {
+  CallbackCuptiActivityApi cupti;
+  cupti.canRejectBuffer_ = true;
+  cupti.setMaxBufferSize(0);
+
+  auto [firstBuffer, firstSize] = cupti.requestBuffer();
+  ASSERT_NE(firstBuffer, nullptr);
+  ASSERT_GT(firstSize, 0);
+  EXPECT_FALSE(cupti.stopCollection);
+
+  auto [secondBuffer, secondSize] = cupti.requestBuffer(firstBuffer, firstSize);
+  EXPECT_TRUE(cupti.stopCollection);
+  EXPECT_EQ(secondBuffer, nullptr);
+  EXPECT_EQ(secondSize, 0);
+
+  cupti.completeBuffer(firstBuffer, firstSize);
+  auto [thirdBuffer, thirdSize] = cupti.requestBuffer(firstBuffer, firstSize);
+  EXPECT_EQ(thirdBuffer, nullptr);
+  EXPECT_EQ(thirdSize, 0);
+  EXPECT_NE(cupti.activityBuffers(), nullptr);
+}
+
+TEST(CuptiActivityApiTest, ClearsCompletedBuffers) {
+  CallbackCuptiActivityApi cupti;
+  cupti.canRejectBuffer_ = true;
+  cupti.setMaxBufferSize(0);
+
+  auto [buffer, size] = cupti.requestBuffer();
+  ASSERT_NE(buffer, nullptr);
+  ASSERT_GT(size, 0);
+  cupti.completeBuffer(buffer, size);
+  ASSERT_FALSE(cupti.stopCollection);
+
+  // The completion left nothing in flight, so this takes the path that has no
+  // buffers to flush. It still has to drop the completed one.
+  cupti.clearActivities();
+  EXPECT_EQ(cupti.activityBuffers(), nullptr);
+}
 
 // Common setup / teardown and helper functions
 class CuptiActivityProfilerTest : public ::testing::Test {
@@ -334,6 +428,29 @@ class CuptiActivityProfilerTest : public ::testing::Test {
   ActivityLoggerFactory loggerFactory;
 };
 
+TEST_F(CuptiActivityProfilerTest, UnavailableCuptiFallsBackToCpuOnly) {
+  cuptiActivities_.available = false;
+  const auto startTime = std::chrono::system_clock::now();
+  constexpr auto duration = std::chrono::nanoseconds(300);
+
+  profiler_->configure(*cfg_, startTime);
+  profiler_->startTrace(startTime);
+
+  const auto startTimeNs = libkineto::timeSinceEpoch(startTime);
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      startTimeNs, startTimeNs + duration.count());
+  cpuOps->addOp("cpu_op", startTimeNs + 20, startTimeNs + 50, 1);
+  profiler_->transferCpuTrace(std::move(cpuOps));
+  profiler_->stopTrace(startTime + duration);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler_->processTrace(*logger);
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+  ASSERT_EQ(trace.activities()->size(), 1);
+  EXPECT_EQ(trace.activities()->front()->name(), "cpu_op");
+}
+
 TEST_F(CuptiActivityProfilerTest, SyncTrace) {
   // Verbose logging is useful for debugging
   std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
@@ -344,10 +461,10 @@ TEST_F(CuptiActivityProfilerTest, SyncTrace) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 300;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
 
   profiler.recordThreadInfo();
@@ -524,10 +641,10 @@ TEST_F(CuptiActivityProfilerTest, SyncEventCorrIdOutOfOrder) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 300;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
 
   profiler.recordThreadInfo();
@@ -657,10 +774,10 @@ TEST_F(CuptiActivityProfilerTest, GpuNCCLCollectiveTest) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 300;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
 
   int64_t kernelLaunchTime = start_time_ns + 20;
@@ -830,10 +947,10 @@ TEST_F(CuptiActivityProfilerTest, GpuUserAnnotationTest) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 300;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
 
   int64_t kernelLaunchTime = start_time_ns + 20;
@@ -900,7 +1017,7 @@ TEST_F(CuptiActivityProfilerTest, SubActivityProfilers) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 1000;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
 
   std::deque<GenericTraceActivity> test_activities{3, ev};
   test_activities[0].startTime = start_time_ns;
@@ -922,7 +1039,7 @@ TEST_F(CuptiActivityProfilerTest, SubActivityProfilers) {
 
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
 
   auto tmpTrace = createTempTraceFile("libkineto_test", ".json");
   LOG(INFO) << "Logging to tmp file " << tmpTrace.path();
@@ -956,10 +1073,10 @@ TEST_F(CuptiActivityProfilerTest, JsonGPUIDSortTest) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 500;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
   profiler.recordThreadInfo();
 
@@ -1040,10 +1157,10 @@ TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 500;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
   profiler.configure(*cfg_, start_time);
   profiler.startTrace(start_time);
-  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
   profiler.recordThreadInfo();
 
@@ -1101,14 +1218,14 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
   int64_t start_time_ns =
       libkineto::timeSinceEpoch(std::chrono::system_clock::now());
   int64_t duration_ns = 500;
-  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  auto start_time = timePointFromNs(start_time_ns);
 
   // Session 1: record eventId=42 with corrId=100, then reset.
   {
     CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ false);
     profiler.configure(*cfg_, start_time);
     profiler.startTrace(start_time);
-    profiler.stopTrace(start_time + nanoseconds(duration_ns));
+    profiler.stopTrace(timePointFromNs(start_time_ns + duration_ns));
     libkineto::get_time_converter() = [](approx_time_t t) { return t; };
     profiler.recordThreadInfo();
 
@@ -1133,14 +1250,14 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
   {
     CuptiActivityProfiler profiler2(cuptiActivities_, /*cpu only*/ false);
     int64_t start_time_ns2 = start_time_ns + 10000;
-    auto start_time2 = time_point<system_clock>(nanoseconds(start_time_ns2));
+    auto start_time2 = timePointFromNs(start_time_ns2);
 
     auto cfg2 = std::make_unique<Config>();
     cfg2->validate(std::chrono::system_clock::now());
 
     profiler2.configure(*cfg2, start_time2);
     profiler2.startTrace(start_time2);
-    profiler2.stopTrace(start_time2 + nanoseconds(duration_ns));
+    profiler2.stopTrace(timePointFromNs(start_time_ns2 + duration_ns));
     libkineto::get_time_converter() = [](approx_time_t t) { return t; };
     profiler2.recordThreadInfo();
 
