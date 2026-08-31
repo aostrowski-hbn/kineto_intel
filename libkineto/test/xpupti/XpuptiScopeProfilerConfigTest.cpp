@@ -6,8 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "src/plugin/xpupti/XpuptiScopeProfilerApi.h"
 #include "src/plugin/xpupti/XpuptiScopeProfilerConfig.h"
+#include "src/plugin/xpupti/XpuptiScopeProfilerApi.h"
 
 #include <fmt/core.h>
 #include <fmt/ranges.h>
@@ -141,9 +141,7 @@ TEST_F(XpuptiScopeProfilerConfigTest, SelectDeviceHandlesOutOfRangeThrows) {
       reinterpret_cast<pti_device_handle_t>(0x10),
       reinterpret_cast<pti_device_handle_t>(0x20)};
   const std::vector<int> indices{0, 5};
-  EXPECT_THROW(
-      KN::selectDeviceHandles(handles, indices),
-      std::runtime_error);
+  EXPECT_THROW(KN::selectDeviceHandles(handles, indices), std::runtime_error);
 }
 
 TEST_F(XpuptiScopeProfilerConfigTest, SelectDeviceHandlesNegativeThrows) {
@@ -151,7 +149,5 @@ TEST_F(XpuptiScopeProfilerConfigTest, SelectDeviceHandlesNegativeThrows) {
       reinterpret_cast<pti_device_handle_t>(0x10),
       reinterpret_cast<pti_device_handle_t>(0x20)};
   const std::vector<int> indices{-1};
-  EXPECT_THROW(
-      KN::selectDeviceHandles(handles, indices),
-      std::runtime_error);
+  EXPECT_THROW(KN::selectDeviceHandles(handles, indices), std::runtime_error);
 }

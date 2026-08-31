@@ -49,8 +49,8 @@ void RunTest(
   EXPECT_TRUE(
       cfg.parse(fmt::format("XPUPTI_PROFILER_MAX_SCOPES = {}", maxScopes)));
   if (!devices.empty()) {
-    EXPECT_TRUE(cfg.parse(
-        fmt::format("XPUPTI_PROFILER_DEVICES = {}", devices)));
+    EXPECT_TRUE(
+        cfg.parse(fmt::format("XPUPTI_PROFILER_DEVICES = {}", devices)));
   }
 
   std::set<KN::ActivityType> activities{
@@ -142,6 +142,10 @@ TEST_F(XpuptiScopeProfilerTest, UserScope) {
 // uses a single queue/device, so requesting device 0 reproduces the same
 // activities as PerKernelScope while covering the multi-device code path.
 TEST_F(XpuptiScopeProfilerTest, PerKernelScopeExplicitDevice0) {
+  GTEST_SKIP() << "Shares the root cause of the skipped PerKernelScope: PTI "
+                  "reports success but returns no scope metric records, so the "
+                  "expected metric activities are absent: "
+                  "https://github.com/pytorch/kineto/issues/1533";
   RunTest("true", 314, "0");
 }
 #endif

@@ -135,7 +135,8 @@ void XpuptiScopeProfilerApi::enableScopeProfiler(const Config& cfg) {
   // Point at the single requested device (default: first device).
   pti_device_handle_t singleHandle = requestedDevices.empty()
       ? devicesHandles[0]
-      : selectDeviceHandles({devicesHandles.get(), deviceCount}, requestedDevices)
+      : selectDeviceHandles(
+            {devicesHandles.get(), deviceCount}, requestedDevices)
             .front();
   XPUPTI_CALL(ptiMetricsScopeConfigure(
       *scopeHandleOpt_,

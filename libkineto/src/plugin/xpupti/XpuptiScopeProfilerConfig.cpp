@@ -45,7 +45,9 @@ bool XpuptiScopeProfilerConfig::handleOption(
     // is a user mistake PTI would otherwise reject).
     const auto tokens = splitAndTrim(val, ',');
     const auto nonEmpty = [](const std::string& tok) { return !tok.empty(); };
-    const auto toIndex = [this](const std::string& tok) { return toInt32(tok); };
+    const auto toIndex = [this](const std::string& tok) {
+      return toInt32(tok);
+    };
     // Dedup in copy_if (which invokes the predicate exactly once per element),
     // not in a views::filter (whose predicate must be pure / may re-evaluate).
     std::unordered_set<int> seen;
