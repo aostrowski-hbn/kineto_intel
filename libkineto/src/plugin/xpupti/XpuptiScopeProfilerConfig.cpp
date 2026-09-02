@@ -7,17 +7,18 @@
  */
 
 #include "XpuptiScopeProfilerConfig.h"
-
 #include <Logger.h>
 
-#include <fmt/core.h>
+#include <algorithm>
+#include <functional>
+#include <iterator>
+#include <ostream>
+#include <ranges>
+#include <string_view>
+#include <unordered_set>
+
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
-
-#include <algorithm>
-#include <iterator>
-#include <ranges>
-#include <unordered_set>
 
 namespace KINETO_NAMESPACE {
 

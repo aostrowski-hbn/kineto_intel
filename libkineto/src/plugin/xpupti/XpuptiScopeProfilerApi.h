@@ -8,13 +8,14 @@
 
 #pragma once
 
+#include <exception>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
 
+#include <pti/pti.h>
 #include <pti/pti_metrics_scope.h>
-
-#include "XpuptiActivityApi.h"
 
 namespace KINETO_NAMESPACE {
 
@@ -34,9 +35,9 @@ class XpuptiScopeProfilerApi {
   void stopScopeActivity();
 
   void processScopeTrace(
-      std::function<void(
+      const std::function<void(
           const pti_metrics_scope_record_t*,
-          const pti_metrics_scope_record_metadata_t& metadata)> handler);
+          const pti_metrics_scope_record_metadata_t& metadata)>& handler);
 
  private:
   struct safe_pti_scope_collection_handle_t {

@@ -6,18 +6,26 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <fmt/core.h>
-
-#include <algorithm>
-#include <iterator>
-#include <span>
-#include <stdexcept>
-#include <utility>
-
 #include "XpuptiScopeProfilerApi.h"
+#include "Config.h"
+#include "ThrowUtil.h"
+#include "XpuptiProfilerMacros.h"
 #include "XpuptiScopeProfilerConfig.h"
 
-#include "ThrowUtil.h"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <fmt/format.h>
+#include <pti/pti.h>
+#include <pti/pti_metrics.h>
 
 namespace KINETO_NAMESPACE {
 
@@ -180,9 +188,9 @@ static size_t IntDivRoundUp(size_t a, size_t b) {
 }
 
 void XpuptiScopeProfilerApi::processScopeTrace(
-    std::function<void(
+    const std::function<void(
         const pti_metrics_scope_record_t*,
-        const pti_metrics_scope_record_metadata_t& metadata)> handler) {
+        const pti_metrics_scope_record_metadata_t& metadata)>& handler) {
   if (scopeHandleOpt_) {
     pti_metrics_scope_record_metadata_t metadata;
     metadata._struct_size = sizeof(pti_metrics_scope_record_metadata_t);
